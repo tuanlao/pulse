@@ -1,15 +1,20 @@
 // Command service is the canonical composition root demonstrating how to wire
-// pulse components together using the unified app.Config:
+// pulse components together. There is no god aggregator config: the service owns
+// its own config struct (appConfig below), embedding the pulse component Configs
+// it needs plus its own cross-cutting fields, and loads it with pkg/config.
 //
-//   - load app.Config (env + all component configs) from YAML
+//   - define appConfig + defaults, load it from YAML (defaults < config.yaml)
+//   - normalize() propagates Env/ServiceName/Version into sub-configs and derives
+//     the gin mode from Env (via pkg/env) — the bit the old app.Normalize did
 //   - build logger, tracer, metrics
-//   - build the HTTP server and an outbound HTTP client (sharing the metrics
-//     registry so /metrics exposes both inbound RED and outbound client metrics)
-//   - register components into the lifecycle manager (tracing first, server last)
+//   - build the HTTP server, an outbound HTTP client, a redis client and a cron
+//     scheduler (all sharing the metrics registry, so /metrics exposes them all)
+//   - register components into the lifecycle manager (tracing first, redis and
+//     cron in the middle, server last)
 //
 // The /call/:name route uses the outbound client to call this service's own
-// /hello/:name, showing that the trace id propagates from the inbound request
-// through the client into headers.
+// /hello/:name, showing the trace id propagates into headers. The /cache route
+// (when redis is enabled) demonstrates rueidis client-side caching.
 package main
 
 import (
@@ -20,18 +25,82 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/tuanlao/pulse/pkg/app"
 	"github.com/tuanlao/pulse/pkg/config"
 	"github.com/tuanlao/pulse/pkg/cron"
+	"github.com/tuanlao/pulse/pkg/env"
 	"github.com/tuanlao/pulse/pkg/http/client"
 	"github.com/tuanlao/pulse/pkg/http/server"
 	"github.com/tuanlao/pulse/pkg/lifecycle"
 	"github.com/tuanlao/pulse/pkg/log"
 	"github.com/tuanlao/pulse/pkg/metrics"
+	"github.com/tuanlao/pulse/pkg/redis"
 	"github.com/tuanlao/pulse/pkg/swagger"
 	"github.com/tuanlao/pulse/pkg/tracing"
 	"go.uber.org/zap"
 )
+
+// appConfig is THIS service's config. Pulse has no unified app.Config — a service
+// composes the component Configs it needs (here every pulse component) alongside
+// its own fields. It is nested-object shaped so it maps onto structured YAML.
+type appConfig struct {
+	Env         env.Env `mapstructure:"env"`
+	ServiceName string  `mapstructure:"service_name"`
+	Version     string  `mapstructure:"version"`
+
+	Log     log.Config     `mapstructure:"log"`
+	Server  server.Config  `mapstructure:"server"`
+	Tracing tracing.Config `mapstructure:"tracing"`
+	Metrics metrics.Config `mapstructure:"metrics"`
+	Swagger swagger.Config `mapstructure:"swagger"`
+	Redis   redis.Config   `mapstructure:"redis"`
+	Cron    cron.Config    `mapstructure:"cron"`
+
+	// Named upstream HTTP clients (e.g. "self", "payment").
+	HttpClients map[string]client.Config `mapstructure:"http_clients"`
+
+	Lifecycle lifecycle.Config `mapstructure:"lifecycle"`
+}
+
+// defaultAppConfig composes each component's defaults. Server.Mode is left empty
+// so normalize() can derive it from Env.
+func defaultAppConfig() appConfig {
+	srv := server.DefaultConfig()
+	srv.Mode = "" // let Env drive the gin mode in normalize()
+
+	return appConfig{
+		Env:         env.EnvDev,
+		ServiceName: "example-service",
+		Version:     "dev",
+		Log:         log.DefaultConfig(),
+		Server:      srv,
+		Tracing:     tracing.DefaultConfig(),
+		Metrics:     metrics.DefaultConfig(),
+		Swagger:     swagger.DefaultConfig(),
+		Redis:       redis.DefaultConfig(),
+		Cron:        cron.DefaultConfig(),
+		HttpClients: map[string]client.Config{},
+		Lifecycle:   lifecycle.DefaultConfig(),
+	}
+}
+
+// normalize propagates cross-cutting values into sub-configs and derives the gin
+// mode from Env — what the removed app.Normalize used to do, now wired explicitly
+// by the service. It is idempotent.
+func (c *appConfig) normalize() {
+	c.Env = c.Env.Normalize()
+	if c.ServiceName != "" && c.Tracing.ServiceName == "" {
+		c.Tracing.ServiceName = c.ServiceName
+	}
+	if c.Version != "" && c.Tracing.ServiceVersion == "" {
+		c.Tracing.ServiceVersion = c.Version
+	}
+	if c.Tracing.Environment == "" {
+		c.Tracing.Environment = string(c.Env)
+	}
+	if c.Server.Mode == "" {
+		c.Server.Mode = c.Env.GinMode()
+	}
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -46,16 +115,13 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 1. Load unified app config (defaults < config.yaml). Config is YAML-only.
-	cfg := app.DefaultConfig()
-	cfg.ServiceName = "example-service"
-	// Tracing is off by default so the demo runs without a collector; the client
-	// still propagates a generated trace id. Set tracing.enabled: true and
-	// tracing.endpoint in config.yaml to export to a collector.
-	cfg.Tracing.Enabled = false
-	if err := app.Load(&cfg, config.DefaultOptions()); err != nil {
+	// 1. Load this service's config (defaults < config.yaml). YAML-only, then
+	// normalize cross-cutting values explicitly.
+	cfg := defaultAppConfig()
+	if err := config.Load(&cfg, config.DefaultOptions()); err != nil {
 		return err
 	}
+	cfg.normalize()
 
 	// 2. Logger — Sync is the OUTERMOST defer so shutdown logs flush last.
 	logger, err := log.New(cfg.Log)
@@ -64,8 +130,8 @@ func run() error {
 	}
 	defer func() { _ = logger.Sync() }()
 
-	// 3. Tracing + metrics. Client metrics register into the server RED registry
-	// so a single /metrics endpoint exposes both.
+	// 3. Tracing + metrics. Component metrics register into the server RED registry
+	// so a single /metrics endpoint exposes all of them.
 	tracer, err := tracing.New(ctx, cfg.Tracing)
 	if err != nil {
 		return err
@@ -116,23 +182,58 @@ func run() error {
 		return err
 	}
 
+	// 6. Redis client (rueidis). Disabled by default in config.yaml so the demo
+	// runs without a redis server; set redis.enabled: true (and run redis >= 6)
+	// to exercise client-side caching via the /cache route. New returns a no-op
+	// client when disabled, so registering it is always safe.
+	var redisMetrics *redis.Metrics
+	if cfg.Redis.Enabled && red != nil {
+		if redisMetrics, err = redis.NewMetrics(cfg.Redis.Metrics, red.Registry()); err != nil {
+			return err
+		}
+	}
+	rdb, err := redis.New(cfg.Redis, redis.Deps{
+		Logger:         logger,
+		TracerProvider: tracer.Provider(),
+		Metrics:        redisMetrics,
+	})
+	if err != nil {
+		return err
+	}
+
 	registerRoutes(srv, selfClient, logger)
 	swagger.Mount(srv.Engine(), cfg.Swagger)
 	srv.Readiness().Register("self", func(context.Context) error { return nil })
 
-	// 6. Cron scheduler with a demo heartbeat job. Cron metrics share the same
-	// registry, so /metrics exposes server + client + cron metrics together.
+	if cfg.Redis.Enabled {
+		// Seed a demo key once; repeated cached GETs are served from the local
+		// client-side cache (no round trip) until the key is invalidated.
+		if err := rdb.Do(ctx, rdb.B().Set().Key("demo:greeting").Value("hello from redis").Build()).Error(); err != nil {
+			return err
+		}
+		registerCacheRoute(srv, rdb, logger)
+		srv.Readiness().Register("redis", rdb.CheckReady)
+	}
+
+	// 7. Cron scheduler with a demo heartbeat job. Cron metrics share the same
+	// registry, so /metrics exposes server + client + redis + cron metrics together.
 	var cronMetrics *cron.CronMetrics
 	if red != nil {
 		if cronMetrics, err = cron.NewMetrics(cfg.Cron.Metrics, red.Registry()); err != nil {
 			return err
 		}
 	}
-	cronSched, err := cron.New(cfg.Cron, cron.Deps{
+	cronDeps := cron.Deps{
 		Logger:         logger,
 		TracerProvider: tracer.Provider(),
 		Metrics:        cronMetrics,
-	})
+	}
+	// Reuse the shared rueidis client for cron's distributed lock (so there's one
+	// redis client). The lock only activates when cron.lock.enabled is true.
+	if cfg.Redis.Enabled {
+		cronDeps.RedisClient = rdb
+	}
+	cronSched, err := cron.New(cfg.Cron, cronDeps)
 	if err != nil {
 		return err
 	}
@@ -144,10 +245,13 @@ func run() error {
 		return nil
 	})
 
-	// 7. Lifecycle: tracing first, server last → server drains before tracing
-	// flushes on shutdown. Cron sits between (stops after the server).
+	// 8. Lifecycle: tracing first, server last → server drains before tracing
+	// flushes on shutdown. Redis and cron sit between (stop after the server).
 	mgr := lifecycle.New(cfg.Lifecycle, logger.LifecycleAdapter())
 	mgr.Register(tracer)
+	if cfg.Redis.Enabled {
+		mgr.Register(rdb)
+	}
 	mgr.Register(cronSched)
 	mgr.Register(srv)
 
@@ -180,5 +284,23 @@ func registerRoutes(srv *server.Server, c *client.Client, base *log.Logger) {
 			return
 		}
 		gc.JSON(http.StatusOK, gin.H{"upstream": out})
+	})
+}
+
+// registerCacheRoute serves a client-side cached read. The first call is a cache
+// miss (round trip); subsequent calls within the TTL are served locally and
+// report cache_hit: true.
+func registerCacheRoute(srv *server.Server, rdb *redis.Client, base *log.Logger) {
+	srv.Engine().GET("/cache", func(gc *gin.Context) {
+		l := log.FromContext(gc.Request.Context(), base)
+		resp := rdb.DoCache(gc.Request.Context(), rdb.B().Get().Key("demo:greeting").Cache(), time.Minute)
+		val, err := resp.ToString()
+		if err != nil {
+			l.Error("redis cache read failed", zap.Error(err))
+			gc.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		l.Info("cache read", zap.Bool("cache_hit", resp.IsCacheHit()))
+		gc.JSON(http.StatusOK, gin.H{"value": val, "cache_hit": resp.IsCacheHit()})
 	})
 }

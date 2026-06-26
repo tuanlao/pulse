@@ -56,7 +56,8 @@ type JobConfig struct {
 type LockConfig struct {
 	// Enabled toggles the distributed lock. Default false.
 	Enabled bool `mapstructure:"enabled"`
-	// Redis is the connection used to build the locker.
+	// Redis is the connection used to build the locker (when no shared rueidis
+	// client is supplied via Deps.RedisClient).
 	Redis RedisConfig `mapstructure:"redis"`
 	// KeyPrefix namespaces lock keys (avoid collisions across services). Default
 	// "pulse:cron".
@@ -64,6 +65,13 @@ type LockConfig struct {
 	// Tries is how many times a pod attempts to acquire the lock before skipping
 	// the run (1 = skip immediately if another pod holds it). Default 1.
 	Tries int `mapstructure:"tries"`
+	// TTL is the lock auto-expiry — the safety net releasing a lock whose pod
+	// crashed mid-run. It should exceed a job's runtime (use JobTimeout to bound
+	// runs). Default 30s.
+	TTL time.Duration `mapstructure:"ttl"`
+	// RetryDelay is the wait between acquisition attempts when Tries > 1. Default
+	// 100ms.
+	RetryDelay time.Duration `mapstructure:"retry_delay"`
 }
 
 // RedisConfig is a redis connection for the cron distributed lock.
@@ -99,10 +107,12 @@ func DefaultConfig() Config {
 		JobTimeout:  0,
 		Singleton:   true,
 		Lock: LockConfig{
-			Enabled:   false,
-			Redis:     RedisConfig{Address: "localhost:6379"},
-			KeyPrefix: "pulse:cron",
-			Tries:     1,
+			Enabled:    false,
+			Redis:      RedisConfig{Address: "localhost:6379"},
+			KeyPrefix:  "pulse:cron",
+			Tries:      1,
+			TTL:        30 * time.Second,
+			RetryDelay: 100 * time.Millisecond,
 		},
 		Metrics: MetricsConfig{
 			Enabled:   true,
@@ -129,6 +139,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Lock.Tries <= 0 {
 		c.Lock.Tries = d.Lock.Tries
+	}
+	if c.Lock.TTL <= 0 {
+		c.Lock.TTL = d.Lock.TTL
+	}
+	if c.Lock.RetryDelay <= 0 {
+		c.Lock.RetryDelay = d.Lock.RetryDelay
 	}
 	if c.Metrics.Namespace == "" {
 		c.Metrics.Namespace = d.Metrics.Namespace

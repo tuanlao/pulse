@@ -1,4 +1,6 @@
-# Example configuration for the pulse demo service (unified app.Config).
+# Example configuration for the pulse demo service. This is the SERVICE's own
+# config (appConfig in main.go) — pulse has no unified app.Config; a service
+# composes the component configs it needs plus its own fields.
 # Config is nested-object (YAML) form only. Precedence: defaults < this file.
 # Run from this directory so "." is on the config search path.
 
@@ -50,6 +52,24 @@ swagger:
   enabled: false
   path: /swagger
 
+redis:
+  enabled: false # set true (and run redis >= 6) to exercise the /cache route
+  addresses: ["localhost:6379"] # one = standalone; many = cluster (auto-discovered)
+  # db: 0
+  # username: ""
+  # password: ""
+  cache: # rueidis client-side caching — the headline feature (needs RESP3 / redis >= 6)
+    enabled: true # false -> DoCache falls back to a normal round trip
+    # size_per_conn: 134217728 # 128 MiB; 0 = rueidis default
+    broadcast:
+      enabled: false # true -> CLIENT TRACKING ... BCAST: server pushes invalidations per prefix
+      prefixes: [] # required when broadcast.enabled, e.g. ["user:", "product:"]
+  # sentinel:
+  #   enabled: true
+  #   master_set: mymaster
+  metrics:
+    enabled: true
+
 cron:
   enabled: true
   timezone: UTC
@@ -64,12 +84,14 @@ cron:
       # cron: "0 */1 * * *"  # alternatively a crontab spec
       # with_seconds: false
       # timeout: 10s         # per-job timeout override
-  lock:
+  lock: # rueidis distributed mutex (redis.Locker). When redis.enabled, main.go shares that client.
     enabled: false # set true for multi-pod: each run is taken by one pod (load spread across pods)
-    redis:
+    redis: # used only when no shared client is passed via Deps.RedisClient
       address: localhost:6379
     key_prefix: "pulse:cron"
     tries: 1 # acquire attempts before skipping the run (1 = skip if held)
+    # retry_delay: 100ms # wait between attempts when tries > 1
+    ttl: 30s # lock auto-expiry (releases a crashed pod's lock); should exceed a job's runtime
   metrics:
     enabled: true
 

@@ -50,7 +50,8 @@ config job whose handler is not registered is a fatal error (fail-fast).
 Off by default so local/dev needs no redis. A redis lock is taken per job run:
 across a fleet of pods, each scheduled run is executed by whichever pod acquires
 the lock, so runs are spread across pods (load distribution) rather than all
-running on every pod.
+running on every pod. The lock is `pkg/redis`'s rueidis-based mutex
+(`redis.Locker`: atomic `SET NX PX` + owner-checked Lua release).
 
 | YAML key (`mapstructure` tag) | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -61,6 +62,8 @@ running on every pod.
 | `lock.redis.db` | `int` | `0` | Redis database number. |
 | `lock.key_prefix` | `string` | `"pulse:cron"` | Namespaces lock keys to avoid cross-service collisions. |
 | `lock.tries` | `int` | `1` | Acquire attempts before skipping the run (`1` = skip if another pod holds it). |
+| `lock.retry_delay` | `duration` | `100ms` | Wait between acquire attempts when `lock.tries > 1`. |
+| `lock.ttl` | `duration` | `30s` | Lock auto-expiry (releases a crashed pod's lock). Should exceed a job's runtime; bound runs with `job_timeout`. |
 
 ### `metrics.*` (per-job Prometheus metrics)
 
@@ -116,10 +119,11 @@ overlapping itself within the process.
 
 The cross-pod redis distributed lock is opt-in (`cfg.Lock.Enabled`). A lock is
 taken per job run, so across a fleet each scheduled run is executed by whichever
-pod wins the lock — spreading load across pods. Locker precedence: `Deps.Locker`
-> `Deps.RedisClient` > `cfg.Lock.Enabled` (otherwise no lock). A redis client
-this package constructs from `cfg.Lock.Redis` is owned and closed on `Stop`; a
-client you pass via `Deps.RedisClient` is not.
+pod wins the lock — spreading load across pods. Precedence: `Deps.Locker`
+(explicit `gocron.Locker`) > `cfg.Lock.Enabled` (otherwise no lock). When enabled,
+the rueidis client is `Deps.RedisClient` (shared, e.g. a `*redis.Client` from
+`pkg/redis`) or one built from `cfg.Lock.Redis`. A client this package constructs
+is owned and closed on `Stop`; a client you pass via `Deps.RedisClient` is not.
 
 ## API / Options / Deps
 
@@ -142,7 +146,7 @@ Key exported functions / types:
 - `TracerProvider trace.TracerProvider` — span per job run; nil → no-op provider.
 - `Metrics *CronMetrics` — enables per-job Prometheus metrics; nil disables them.
 - `Locker gocron.Locker` — overrides the distributed locker (highest precedence).
-- `RedisClient redis.UniversalClient` — builds the locker from this shared client instead of from `cfg.Lock.Redis`.
+- `RedisClient rueidis.Client` — when `lock.enabled`, builds the locker from this shared rueidis client (e.g. a `*redis.Client`) instead of from `cfg.Lock.Redis`.
 
 Functional `Option`s (override `Config`):
 

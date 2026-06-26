@@ -8,12 +8,11 @@ import (
 	"sync"
 	"time"
 
-	redislock "github.com/go-co-op/gocron-redis-lock/v2"
 	gocron "github.com/go-co-op/gocron/v2"
-	redsync "github.com/go-redsync/redsync/v4"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
+	"github.com/redis/rueidis"
 	"github.com/tuanlao/pulse/pkg/log"
+	pulseredis "github.com/tuanlao/pulse/pkg/redis"
 	"github.com/tuanlao/pulse/pkg/tracing"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -34,11 +33,13 @@ type Deps struct {
 	TracerProvider trace.TracerProvider
 	// Metrics enables per-job Prometheus metrics; nil disables them.
 	Metrics *CronMetrics
-	// Locker overrides the distributed locker (highest precedence).
+	// Locker overrides the distributed locker (highest precedence; bypasses
+	// Config.Lock entirely).
 	Locker gocron.Locker
-	// RedisClient, when set, builds the distributed locker from this shared client
-	// instead of constructing one from Config.Lock.Redis.
-	RedisClient redis.UniversalClient
+	// RedisClient, when set and Config.Lock.Enabled, builds the distributed locker
+	// from this shared rueidis client instead of constructing one from
+	// Config.Lock.Redis. The shared client is not owned (not closed on Stop).
+	RedisClient rueidis.Client
 }
 
 // Scheduler wraps a gocron scheduler and implements lifecycle.Component.
@@ -48,9 +49,9 @@ type Scheduler struct {
 	sched       gocron.Scheduler
 	tracer      trace.Tracer
 	baseCtx     context.Context
-	ownedRedis  redis.UniversalClient // closed on Stop only when built by this package
-	mu          sync.RWMutex          // guards handlers and jobTimeouts
-	handlers    map[string]JobFunc    // name -> handler, for jobs declared in config
+	ownedRedis  rueidis.Client     // closed on Stop only when built by this package
+	mu          sync.RWMutex       // guards handlers and jobTimeouts
+	handlers    map[string]JobFunc // name -> handler, for jobs declared in config
 	jobTimeouts map[string]time.Duration
 	started     bool
 }
@@ -94,7 +95,7 @@ func New(cfg Config, deps Deps, opts ...Option) (*Scheduler, error) {
 	sched, err := gocron.NewScheduler(schedOpts...)
 	if err != nil {
 		if owned != nil {
-			_ = owned.Close()
+			owned.Close()
 		}
 		return nil, fmt.Errorf("cron: new scheduler: %w", err)
 	}
@@ -111,44 +112,71 @@ func New(cfg Config, deps Deps, opts ...Option) (*Scheduler, error) {
 	}, nil
 }
 
-// buildLocker returns the redis distributed locker (or nil when no lock is
-// configured) plus the redis client this package owns (to close on Stop). With
+// buildLocker returns the gocron distributed locker (or nil when no lock is
+// configured) plus the rueidis client this package owns (to close on Stop). With
 // a per-job lock, each scheduled run is taken by whichever pod wins the lock, so
 // load is distributed across pods.
-func buildLocker(cfg Config, deps Deps) (gocron.Locker, redis.UniversalClient, error) {
+//
+// Precedence: Deps.Locker (explicit) > Config.Lock.Enabled. When the lock is
+// enabled, the rueidis client is Deps.RedisClient (shared, not owned) or one
+// built from Config.Lock.Redis (owned, closed on Stop).
+func buildLocker(cfg Config, deps Deps) (gocron.Locker, rueidis.Client, error) {
 	if deps.Locker != nil {
 		return deps.Locker, nil, nil
 	}
-
-	var client redis.UniversalClient
-	var owned redis.UniversalClient
-	switch {
-	case deps.RedisClient != nil:
-		client = deps.RedisClient
-	case cfg.Lock.Enabled:
-		client = redis.NewClient(&redis.Options{
-			Addr:     cfg.Lock.Redis.Address,
-			Username: cfg.Lock.Redis.Username,
-			Password: cfg.Lock.Redis.Password,
-			DB:       cfg.Lock.Redis.DB,
-		})
-		owned = client
-	default:
+	if !cfg.Lock.Enabled {
 		return nil, nil, nil // no distributed lock
 	}
 
-	locker, err := redislock.NewRedisLockerWithOptions(client,
-		redislock.WithKeyPrefix(cfg.Lock.KeyPrefix),
-		redislock.WithRedsyncOptions(redsync.WithTries(cfg.Lock.Tries)),
-	)
-	if err != nil {
-		if owned != nil {
-			_ = owned.Close()
-		}
-		return nil, nil, fmt.Errorf("cron: build redis locker: %w", err)
+	client := deps.RedisClient
+	if rc, ok := client.(*pulseredis.Client); ok && !rc.Enabled() {
+		// A disabled *pulseredis.Client is a non-nil interface wrapping a nil
+		// rueidis.Client (it never dialed); using it would panic on first Lock.
+		// Treat it as "no shared client" and build a dedicated lock client below.
+		client = nil
 	}
-	return locker, owned, nil
+	var owned rueidis.Client
+	if client == nil {
+		c, err := rueidis.NewClient(rueidis.ClientOption{
+			InitAddress:  []string{cfg.Lock.Redis.Address},
+			Username:     cfg.Lock.Redis.Username,
+			Password:     cfg.Lock.Redis.Password,
+			SelectDB:     cfg.Lock.Redis.DB,
+			DisableCache: true, // a lock client needs no client-side caching
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("cron: build redis lock client: %w", err)
+		}
+		client = c
+		owned = c
+	}
+
+	locker := pulseredis.NewLocker(client,
+		pulseredis.WithLockKeyPrefix(cfg.Lock.KeyPrefix),
+		pulseredis.WithLockTries(cfg.Lock.Tries),
+		pulseredis.WithLockTTL(cfg.Lock.TTL),
+		pulseredis.WithLockRetryDelay(cfg.Lock.RetryDelay),
+	)
+	return gocronLocker{locker}, owned, nil
 }
+
+// gocronLocker adapts a *pulseredis.Locker to gocron.Locker. A failed
+// acquisition (ErrLockNotAcquired) is returned as an error so gocron skips the
+// run — exactly the "one pod per scheduled run" behavior.
+type gocronLocker struct{ l *pulseredis.Locker }
+
+func (g gocronLocker) Lock(ctx context.Context, key string) (gocron.Lock, error) {
+	lk, err := g.l.Lock(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return gocronLock{lk}, nil
+}
+
+// gocronLock adapts a *pulseredis.Lock to gocron.Lock.
+type gocronLock struct{ lk *pulseredis.Lock }
+
+func (g gocronLock) Unlock(ctx context.Context) error { return g.lk.Unlock(ctx) }
 
 // Register binds a handler to a job name so the job can be declared (scheduled)
 // in configuration (Config.Jobs). Call it before the scheduler is started.
@@ -339,9 +367,7 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 		}
 	}
 	if s.ownedRedis != nil {
-		if err := s.ownedRedis.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("cron: redis close: %w", err))
-		}
+		s.ownedRedis.Close() // rueidis Close is synchronous and returns no error
 	}
 	return errors.Join(errs...)
 }
