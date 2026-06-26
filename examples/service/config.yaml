@@ -1,0 +1,78 @@
+# Example configuration for the pulse demo service (unified app.Config).
+# Config is nested-object (YAML) form only. Precedence: defaults < this file.
+# Run from this directory so "." is on the config search path.
+
+env: DEV # LOCAL | DEV | UAT | STG | PROD — drives gin mode (PROD/STG/UAT=release)
+service_name: example-service
+version: dev
+
+log:
+  level: info
+  encoding: console # "console" -> [time][LEVEL] msg field=value ; "json" for prod
+
+server:
+  port: 8080
+  read_timeout: 15s
+  write_timeout: 15s
+  idle_timeout: 60s
+  read_header_timeout: 5s # Slowloris guard
+  shutdown_drain: 25s
+  max_body_bytes: 1048576 # 1 MiB
+  cors:
+    enabled: false
+
+# Named upstream HTTP clients. Each is a nested object (pool/retry/trace/timeouts).
+http_clients:
+  self:
+    base_url: http://127.0.0.1:8080
+    timeouts:
+      request: 10s
+    pool:
+      max_idle_conns_per_host: 20
+    retry:
+      enabled: true
+      max_attempts: 3
+    trace:
+      trace_id_header: X-Trace-Id
+
+metrics:
+  enabled: true
+  path: /metrics
+
+tracing:
+  enabled: true # false = no tracing at all (no trace_id/span_id in logs)
+  protocol: grpc # or "http"
+  endpoint: "" # empty = generate trace_id/span_id for logs but DON'T export (no collector needed); set e.g. localhost:4317 to export to an OTLP collector
+  insecure: true
+  sample_ratio: 1.0
+
+swagger:
+  enabled: false
+  path: /swagger
+
+cron:
+  enabled: true
+  timezone: UTC
+  stop_timeout: 30s
+  singleton: true # prevent a job from overlapping itself within this pod
+  # job_timeout: 30s # uncomment to bound every job run
+  # Jobs are declared here; handlers are bound in code via cronSched.Register(name, fn).
+  jobs:
+    heartbeat:
+      enabled: true
+      every: 5s
+      # cron: "0 */1 * * *"  # alternatively a crontab spec
+      # with_seconds: false
+      # timeout: 10s         # per-job timeout override
+  lock:
+    enabled: false # set true for multi-pod: each run is taken by one pod (load spread across pods)
+    redis:
+      address: localhost:6379
+    key_prefix: "pulse:cron"
+    tries: 1 # acquire attempts before skipping the run (1 = skip if held)
+  metrics:
+    enabled: true
+
+lifecycle:
+  shutdown_timeout: 30s
+  start_timeout: 15s

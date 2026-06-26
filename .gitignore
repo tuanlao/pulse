@@ -1,0 +1,24 @@
+.DS_Store
+.env
+
+# Binaries and build output
+/bin/
+*.exe
+*.out
+
+# Test & coverage artifacts
+*.test
+coverage.out
+coverage.html
+
+# Generated swagger docs (run `swag init` locally)
+# docs/
+
+# Editor/OS
+*.swp
+.idea/
+.vscode/
+
+# Local Claude workspace (docs, skills, memory) — not committed
+.claude/
+CLAUDE.md
