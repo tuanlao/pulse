@@ -99,7 +99,7 @@ derive the gin mode (`cfg.Server.Mode = cfg.Env.GinMode()`).
 
 ## Conventions
 
-Every package follows the same shape — see [`CLAUDE.md`](CLAUDE.md) for details:
+Every package follows the same shape:
 
 1. **Configurable** — `Config` (with `mapstructure` tags) + `DefaultConfig()` + `Option`s.
 2. **Sensible defaults** — `DefaultConfig()` is the source of truth; sources only override.
