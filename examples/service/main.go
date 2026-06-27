@@ -35,6 +35,7 @@ import (
 	"github.com/tuanlao/pulse/pkg/log"
 	"github.com/tuanlao/pulse/pkg/metrics"
 	"github.com/tuanlao/pulse/pkg/redis"
+	"github.com/tuanlao/pulse/pkg/snowflake"
 	"github.com/tuanlao/pulse/pkg/swagger"
 	"github.com/tuanlao/pulse/pkg/tracing"
 	"go.uber.org/zap"
@@ -48,14 +49,15 @@ type appConfig struct {
 	ServiceName string  `mapstructure:"service_name"`
 	Version     string  `mapstructure:"version"`
 
-	Log     log.Config     `mapstructure:"log"`
-	Server  server.Config  `mapstructure:"server"`
-	Tracing tracing.Config `mapstructure:"tracing"`
-	Metrics metrics.Config `mapstructure:"metrics"`
-	Swagger swagger.Config `mapstructure:"swagger"`
-	Redis   redis.Config   `mapstructure:"redis"`
-	Cron    cron.Config    `mapstructure:"cron"`
-	Kafka   kafka.Config   `mapstructure:"kafka"`
+	Log       log.Config       `mapstructure:"log"`
+	Server    server.Config    `mapstructure:"server"`
+	Tracing   tracing.Config   `mapstructure:"tracing"`
+	Metrics   metrics.Config   `mapstructure:"metrics"`
+	Swagger   swagger.Config   `mapstructure:"swagger"`
+	Redis     redis.Config     `mapstructure:"redis"`
+	Cron      cron.Config      `mapstructure:"cron"`
+	Kafka     kafka.Config     `mapstructure:"kafka"`
+	Snowflake snowflake.Config `mapstructure:"snowflake"`
 
 	// Named upstream HTTP clients (e.g. "self", "payment").
 	HttpClients map[string]client.Config `mapstructure:"http_clients"`
@@ -81,6 +83,7 @@ func defaultAppConfig() appConfig {
 		Redis:       redis.DefaultConfig(),
 		Cron:        cron.DefaultConfig(),
 		Kafka:       kafka.DefaultConfig(),
+		Snowflake:   snowflake.DefaultConfig(),
 		HttpClients: map[string]client.Config{},
 		Lifecycle:   lifecycle.DefaultConfig(),
 	}
@@ -259,6 +262,33 @@ func run() error {
 		return nil
 	})
 
+	// 7b. Snowflake id generator. Default strategy is "static" so the demo runs
+	// without redis; set snowflake.worker_id.strategy: redis (and redis.enabled) to
+	// have pods contend for a worker-id slot. Metrics share the same registry.
+	var snowflakeMetrics *snowflake.Metrics
+	if red != nil {
+		if snowflakeMetrics, err = snowflake.NewMetrics(cfg.Snowflake.Metrics, red.Registry()); err != nil {
+			return err
+		}
+	}
+	snowflakeDeps := snowflake.Deps{
+		Logger:         logger,
+		TracerProvider: tracer.Provider(),
+		Metrics:        snowflakeMetrics,
+	}
+	// Reuse the shared rueidis client for the redis worker-id strategy.
+	if cfg.Redis.Enabled {
+		snowflakeDeps.RedisClient = rdb
+	}
+	gen, err := snowflake.New(cfg.Snowflake, snowflakeDeps)
+	if err != nil {
+		return err
+	}
+	registerIDRoute(srv, gen, logger)
+	if cfg.Snowflake.Enabled {
+		srv.Readiness().Register("snowflake", gen.CheckReady)
+	}
+
 	// 8. Kafka producer + consumer. Disabled by default in config.yaml so the demo
 	// runs without a broker (New returns no-op components when disabled). The
 	// consumer reuses the shared rueidis client for the global (redis) deduper when
@@ -300,6 +330,7 @@ func run() error {
 	mgr.Register(kProducer)
 	mgr.Register(kConsumer)
 	mgr.Register(cronSched)
+	mgr.Register(gen) // after redis (stops before redis closes), before the server
 	mgr.Register(srv)
 
 	logger.Info("starting service",
@@ -331,6 +362,28 @@ func registerRoutes(srv *server.Server, c *client.Client, base *log.Logger) {
 			return
 		}
 		gc.JSON(http.StatusOK, gin.H{"upstream": out})
+	})
+}
+
+// registerIDRoute mints a snowflake id and returns it with its decoded parts. It
+// uses TryGenerate so the route responds with an error (instead of panicking) if
+// the generator is disabled or — for the redis strategy — not yet ready/fenced.
+func registerIDRoute(srv *server.Server, gen *snowflake.Generator, base *log.Logger) {
+	srv.Engine().GET("/id", func(gc *gin.Context) {
+		l := log.FromContext(gc.Request.Context(), base)
+		id, err := gen.TryGenerate()
+		if err != nil {
+			l.Error("snowflake generate failed", zap.Error(err))
+			gc.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		gc.JSON(http.StatusOK, gin.H{
+			"id":     id.String(),
+			"base58": id.Base58(),
+			"node":   gen.Node(id),
+			"step":   gen.Step(id),
+			"time":   gen.TimeAt(id).UTC().Format(time.RFC3339Nano),
+		})
 	})
 }
 

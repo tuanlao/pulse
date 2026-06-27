@@ -132,6 +132,26 @@ kafka:
   metrics:
     enabled: true
 
+snowflake:
+  enabled: true
+  # epoch: 1288834974657 # ms; default Twitter epoch (0 = use default)
+  node_bits: 10 # 1024 worker ids; node_bits + step_bits must be <= 22
+  step_bits: 12 # 4096 ids/ms/node
+  worker_id:
+    strategy: static # static | statefulset | redis
+    static: 1 # used by strategy: static
+    statefulset:
+      pod_name_env: POD_NAME # used by strategy: statefulset; falls back to hostname. Errors for a Deployment.
+    redis: # used by strategy: redis — pods contend for a unique slot. main.go shares the redis client when redis.enabled.
+      redis:
+        address: localhost:6379
+      key_prefix: "pulse:snowflake:worker"
+      ttl: 15s # slot lease auto-expiry (frees a crashed pod's slot)
+      # renew_interval: 5s # default ttl/3
+      # max_id: 0 # 0 = 2^node_bits slots
+  metrics:
+    enabled: true
+
 lifecycle:
   shutdown_timeout: 30s
   start_timeout: 15s
