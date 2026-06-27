@@ -95,6 +95,43 @@ cron:
   metrics:
     enabled: true
 
+kafka:
+  enabled: false # set true (and run a broker) to exercise produce/consume via POST /publish/:id
+  client:
+    brokers: ["localhost:9092"]
+    client_id: example-service
+    # sasl: { enabled: true, mechanism: scram-sha-256, username: u, password: p }
+    # tls:  { enabled: true }
+  admin:
+    auto_create: true # false = validate topics exist on Start and fail fast (production)
+    partitions: 4
+    replication_factor: 1 # set >= 3 in production
+  producer:
+    topics: ["orders"] # topics this producer publishes to — provisioned on Start
+    #                    (auto_create=true -> created if missing; false -> Start fails fast if missing)
+    required_acks: all
+    compression: snappy
+  consumer:
+    group_id: example-service
+    topics: ["orders"] # origin topics (these get the retry/DLQ pipeline)
+    mode: unordered # unordered (high-concurrency) | ordered | key_ordered
+    commit_immediately: false # true = at-most-once, high throughput, ACCEPTS message loss
+    concurrency: 256
+  retry:
+    enabled: true
+    strategy: auto # auto (unordered=retry-topics, ordered=in-place) | blocking | non_blocking
+    backoffs: ["5s", "10s", "1m"] # tier delays -> orders.retry.5s / .10s / .1m
+    # scope_to_group: false # true -> stamp the group so only it reprocesses a retry
+    dlq:
+      enabled: true # exhausted/non-retryable -> orders.dlq
+  dedup:
+    enabled: false # opt-in; recommended for unordered+retry to avoid reprocessing on crash
+    mode: local # local (otter, per-pod) | redis (shared; needs redis.enabled)
+    ttl: 1h # must exceed the total retry lifetime
+    # redis: { key_prefix: "pulse:kafka:dedup", client_side_cache: true, cache_ttl: 30s }
+  metrics:
+    enabled: true
+
 lifecycle:
   shutdown_timeout: 30s
   start_timeout: 15s

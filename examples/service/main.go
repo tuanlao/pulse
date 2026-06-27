@@ -30,6 +30,7 @@ import (
 	"github.com/tuanlao/pulse/pkg/env"
 	"github.com/tuanlao/pulse/pkg/http/client"
 	"github.com/tuanlao/pulse/pkg/http/server"
+	"github.com/tuanlao/pulse/pkg/kafka"
 	"github.com/tuanlao/pulse/pkg/lifecycle"
 	"github.com/tuanlao/pulse/pkg/log"
 	"github.com/tuanlao/pulse/pkg/metrics"
@@ -54,6 +55,7 @@ type appConfig struct {
 	Swagger swagger.Config `mapstructure:"swagger"`
 	Redis   redis.Config   `mapstructure:"redis"`
 	Cron    cron.Config    `mapstructure:"cron"`
+	Kafka   kafka.Config   `mapstructure:"kafka"`
 
 	// Named upstream HTTP clients (e.g. "self", "payment").
 	HttpClients map[string]client.Config `mapstructure:"http_clients"`
@@ -78,6 +80,7 @@ func defaultAppConfig() appConfig {
 		Swagger:     swagger.DefaultConfig(),
 		Redis:       redis.DefaultConfig(),
 		Cron:        cron.DefaultConfig(),
+		Kafka:       kafka.DefaultConfig(),
 		HttpClients: map[string]client.Config{},
 		Lifecycle:   lifecycle.DefaultConfig(),
 	}
@@ -99,6 +102,17 @@ func (c *appConfig) normalize() {
 	}
 	if c.Server.Mode == "" {
 		c.Server.Mode = c.Env.GinMode()
+	}
+	// Propagate cross-cutting values into the kafka config (used for x-source and
+	// the gin-mode-like Env derivations).
+	if c.Kafka.ServiceName == "" {
+		c.Kafka.ServiceName = c.ServiceName
+	}
+	if c.Kafka.Version == "" {
+		c.Kafka.Version = c.Version
+	}
+	if c.Kafka.Env == "" {
+		c.Kafka.Env = c.Env
 	}
 }
 
@@ -245,13 +259,46 @@ func run() error {
 		return nil
 	})
 
-	// 8. Lifecycle: tracing first, server last → server drains before tracing
-	// flushes on shutdown. Redis and cron sit between (stop after the server).
+	// 8. Kafka producer + consumer. Disabled by default in config.yaml so the demo
+	// runs without a broker (New returns no-op components when disabled). The
+	// consumer reuses the shared rueidis client for the global (redis) deduper when
+	// redis is enabled; otherwise dedup defaults to the in-process (local) cache.
+	var kafkaMetrics *kafka.Metrics
+	if red != nil {
+		if kafkaMetrics, err = kafka.NewMetrics(cfg.Kafka.Metrics, red.Registry()); err != nil {
+			return err
+		}
+	}
+	kafkaDeps := kafka.Deps{Logger: logger, TracerProvider: tracer.Provider(), Metrics: kafkaMetrics}
+	if cfg.Redis.Enabled {
+		kafkaDeps.RedisClient = rdb
+	}
+	kProducer, err := kafka.NewProducer(cfg.Kafka, kafkaDeps)
+	if err != nil {
+		return err
+	}
+	kConsumer, err := kafka.NewConsumer(cfg.Kafka, kafkaDeps)
+	if err != nil {
+		return err
+	}
+	// Typed handler: the payload is JSON-decoded into orderEvent before it runs.
+	// Returning an error exercises the retry-topic pipeline; kafka.NonRetryable
+	// would route straight to the DLQ.
+	kafka.On(kConsumer, "orders", func(hctx context.Context, e orderEvent, _ *kafka.Message) error {
+		log.FromContext(hctx, logger).Info("order received", zap.String("id", e.ID), zap.Int("amount", e.Amount))
+		return nil
+	})
+	registerPublishRoute(srv, kProducer, logger)
+
+	// 9. Lifecycle: tracing first, server last → server drains before tracing
+	// flushes on shutdown. Redis, kafka and cron sit between (stop after the server).
 	mgr := lifecycle.New(cfg.Lifecycle, logger.LifecycleAdapter())
 	mgr.Register(tracer)
 	if cfg.Redis.Enabled {
 		mgr.Register(rdb)
 	}
+	mgr.Register(kProducer)
+	mgr.Register(kConsumer)
 	mgr.Register(cronSched)
 	mgr.Register(srv)
 
@@ -284,6 +331,29 @@ func registerRoutes(srv *server.Server, c *client.Client, base *log.Logger) {
 			return
 		}
 		gc.JSON(http.StatusOK, gin.H{"upstream": out})
+	})
+}
+
+// orderEvent is the demo payload produced to / consumed from the "orders" topic.
+type orderEvent struct {
+	ID     string `json:"id"`
+	Amount int    `json:"amount"`
+}
+
+// registerPublishRoute publishes an order event to the "orders" topic via the
+// typed Send. When kafka is disabled the producer is a no-op, so the route still
+// responds (the message is simply dropped).
+func registerPublishRoute(srv *server.Server, p *kafka.Producer, base *log.Logger) {
+	srv.Engine().POST("/publish/:id", func(gc *gin.Context) {
+		l := log.FromContext(gc.Request.Context(), base)
+		id := gc.Param("id")
+		evt := orderEvent{ID: id, Amount: 100}
+		if err := kafka.Send(gc.Request.Context(), p, "orders", id, evt); err != nil {
+			l.Error("kafka publish failed", zap.Error(err))
+			gc.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		gc.JSON(http.StatusOK, gin.H{"published": evt})
 	})
 }
 
