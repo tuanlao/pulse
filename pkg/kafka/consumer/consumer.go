@@ -8,6 +8,7 @@ package consumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -230,7 +231,7 @@ func (c *Consumer) Start(ctx context.Context) error {
 	if err := cl.Ping(ctx); err != nil {
 		return fmt.Errorf("kafka consumer: ping: %w", err)
 	}
-	if err := admin.Provision(ctx, cl, c.deps.Admin, subscription, c.log); err != nil {
+	if err := admin.Provision(ctx, cl, c.deps.Admin, c.provisionTopics(subscription), c.log); err != nil {
 		return fmt.Errorf("kafka consumer: provision topics: %w", err)
 	}
 
@@ -286,17 +287,30 @@ func (c *Consumer) pollLoop() {
 			return
 		}
 		fetches := c.cl.PollRecords(c.loopCtx, c.cfg.MaxPollRecords)
-		if fetches.IsClientClosed() || c.loopCtx.Err() != nil {
-			return
+		closed := fetches.IsClientClosed()
+		if !closed {
+			fetches.EachError(func(t string, p int32, err error) {
+				// A poll cancelled by shutdown surfaces as a context error, not a
+				// real fetch failure — don't log it.
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+				c.log.Error("kafka fetch error", zap.String("topic", t), zap.Int32("partition", p), zap.Error(err))
+			})
+			fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
+				c.dispatchPartition(ftp)
+			})
 		}
-		fetches.EachError(func(t string, p int32, err error) {
-			c.log.Error("kafka fetch error", zap.String("topic", t), zap.Int32("partition", p), zap.Error(err))
-		})
-		fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
-			c.dispatchPartition(ftp)
-		})
+		// Release the poller gate after every poll — including the shutdown path.
+		// With BlockRebalanceOnPoll a context-cancelled PollRecords still registers
+		// a poller (it is "returning a fetch"); returning without AllowRebalance
+		// leaves that poller dangling and deadlocks LeaveGroup inside Close().
+		// AllowRebalance only touches in-memory state, so it is safe even here.
 		if c.blockRebalance {
 			c.cl.AllowRebalance()
+		}
+		if closed || c.loopCtx.Err() != nil {
+			return
 		}
 	}
 }
@@ -359,6 +373,33 @@ func (c *Consumer) subscription() []string {
 	out := make([]string, 0, len(set))
 	for t := range set {
 		out = append(out, t)
+	}
+	return out
+}
+
+// provisionTopics is the set of topics to create on Start: the subscription
+// (origins + retry tiers) plus each origin's DLQ. The DLQ is terminal — produced
+// to but never consumed — so it is not in the subscription; without provisioning
+// it here a forward to the DLQ fails on a missing topic (the produce-capable
+// client does not trigger broker auto-creation) and the record is reprocessed
+// forever instead of landing in the DLQ.
+func (c *Consumer) provisionTopics(subscription []string) []string {
+	if !c.deps.Retry.DLQ.Enabled {
+		return subscription
+	}
+	namer := retry.NewNamer(c.deps.Retry)
+	set := make(map[string]struct{}, len(subscription))
+	out := make([]string, 0, len(subscription)+len(c.cfg.Topics))
+	for _, t := range subscription {
+		set[t] = struct{}{}
+		out = append(out, t)
+	}
+	for _, o := range c.cfg.Topics {
+		dlq := namer.DLQTopic(o, c.cfg.GroupID)
+		if _, ok := set[dlq]; !ok {
+			set[dlq] = struct{}{}
+			out = append(out, dlq)
+		}
 	}
 	return out
 }

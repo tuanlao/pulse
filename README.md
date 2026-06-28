@@ -133,6 +133,51 @@ go vet ./...
 golangci-lint run        # if installed
 ```
 
+### Integration tests
+
+Integration tests run against real infrastructure and are guarded by the
+`integration` build tag, so the unit-test command above never touches Docker.
+A `docker-compose.yml` provides the three dependencies they exercise: redis,
+Kafka (single-node KRaft) and a Temporal dev server.
+
+```sh
+make infra-up            # docker compose up -d --wait (redis, kafka, temporal)
+make test-integration    # go test -race -tags=integration ./...
+make infra-down          # tear the stack down
+```
+
+What they cover (edge cases and config permutations across each module):
+
+- `examples/service` — end-to-end: an HTTP API publishes a Kafka event and a
+  worker (consumer) receives and processes it (call-API → publish → consume).
+- `pkg/kafka` — processing modes (unordered / ordered / key_ordered), commit
+  semantics (at-least-once redelivery, at-most-once, resume-from-committed),
+  consumer-group rebalance, the retry pipeline (blocking in-place vs non-blocking
+  retry topics, progressive tiers, delay formats, scope-to-group), the DLQ
+  (terminal consumption, disabled-drops, error headers), dedup (local + shared
+  redis + TTL expiry), custom codecs + decode-failure routing, producer options
+  (async hooks, compression, required-acks, multi-topic), admin provisioning, and
+  disabled no-ops.
+- `pkg/redis` — client-side cache invalidation, broadcast (BCAST) prefix tracking,
+  and Locker semantics (TTL expiry, retries, contention).
+- `pkg/snowflake` — redis slot lease renewal, concurrent id uniqueness, fencing on
+  lease loss, and the statefulset strategy.
+- `pkg/cron` — the redis distributed lock (shared client + multiple independent
+  jobs) enforces single-pod-per-run.
+- `pkg/temporal` — saga compensation (reverse-LIFO, parallel, stop-on-failure),
+  Continue-As-New, signals, queries, and activity retries / timeouts.
+- `pkg/http` — outbound client retry/backoff, timeouts, trace-context propagation,
+  and the server's body-limit, readiness gating, panic recovery, and graceful
+  drain (real loopback listener; no docker needed).
+
+Infra addresses are read from env vars (defaults shown), so the tests can point
+at an existing stack instead of compose:
+`KAFKA_BROKERS=localhost:9092`, `REDIS_ADDR=localhost:6379`,
+`TEMPORAL_HOSTPORT=localhost:7233`.
+
+> Out of scope (single-node stack): transport security and topology variants —
+> kafka TLS/SASL, redis TLS/cluster/sentinel, and multi-broker replication.
+
 ## Status
 
 Implemented: config, env, lifecycle, log, tracing, metrics, http server + client,
