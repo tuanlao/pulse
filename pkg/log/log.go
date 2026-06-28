@@ -247,6 +247,12 @@ func (l *Logger) LifecycleAdapter() *kvAdapter { return &kvAdapter{l: l} }
 // caller to the adapter instead of the real call site.
 func (l *Logger) GocronAdapter() *kvAdapter { return &kvAdapter{l: l} }
 
+// TemporalAdapter adapts a Logger to the Temporal SDK's log.Logger interface
+// (Debug/Info/Warn/Error with key-value variadics). Like GocronAdapter it logs
+// through the underlying zap logger directly so the single AddCallerSkip(1) baked
+// in by New still attributes the call site to the SDK caller, not the adapter.
+func (l *Logger) TemporalAdapter() *kvAdapter { return &kvAdapter{l: l} }
+
 // kvAdapter bridges *Logger to foreign slog-style key/value logger interfaces
 // (lifecycle.Logger, gocron.Logger). It calls a.l.z.* directly so exactly one
 // wrapper frame sits between the caller and zap, matching New's AddCallerSkip(1).

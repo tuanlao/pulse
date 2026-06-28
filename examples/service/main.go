@@ -37,6 +37,7 @@ import (
 	"github.com/tuanlao/pulse/pkg/redis"
 	"github.com/tuanlao/pulse/pkg/snowflake"
 	"github.com/tuanlao/pulse/pkg/swagger"
+	"github.com/tuanlao/pulse/pkg/temporal"
 	"github.com/tuanlao/pulse/pkg/tracing"
 	"go.uber.org/zap"
 )
@@ -58,6 +59,7 @@ type appConfig struct {
 	Cron      cron.Config      `mapstructure:"cron"`
 	Kafka     kafka.Config     `mapstructure:"kafka"`
 	Snowflake snowflake.Config `mapstructure:"snowflake"`
+	Temporal  temporal.Config  `mapstructure:"temporal"`
 
 	// Named upstream HTTP clients (e.g. "self", "payment").
 	HttpClients map[string]client.Config `mapstructure:"http_clients"`
@@ -84,6 +86,7 @@ func defaultAppConfig() appConfig {
 		Cron:        cron.DefaultConfig(),
 		Kafka:       kafka.DefaultConfig(),
 		Snowflake:   snowflake.DefaultConfig(),
+		Temporal:    temporal.DefaultConfig(),
 		HttpClients: map[string]client.Config{},
 		Lifecycle:   lifecycle.DefaultConfig(),
 	}
@@ -116,6 +119,11 @@ func (c *appConfig) normalize() {
 	}
 	if c.Kafka.Env == "" {
 		c.Kafka.Env = c.Env
+	}
+	// Default the worker task queue from the service name so a service only needs
+	// to flip temporal.enabled on.
+	if c.Temporal.Worker.TaskQueue == "" {
+		c.Temporal.Worker.TaskQueue = c.ServiceName + "-tasks"
 	}
 }
 
@@ -320,6 +328,34 @@ func run() error {
 	})
 	registerPublishRoute(srv, kProducer, logger)
 
+	// 8b. Temporal (saga orchestrator). Disabled by default in config.yaml so the
+	// demo runs without a Temporal server; run `temporal server start-dev` and set
+	// temporal.enabled=true to exercise POST /transfer. The client dials once and
+	// owns the connection; the worker runs on the SAME connection (shared, not
+	// owned). The SDK's own metrics bridge into the shared registry via tally.
+	tDeps := temporal.Deps{Logger: logger, TracerProvider: tracer.Provider()}
+	if red != nil {
+		tDeps.Registry = red.Registry()
+	}
+	tcli, err := temporal.NewClient(cfg.Temporal, tDeps)
+	if err != nil {
+		return err
+	}
+	tworker, err := temporal.NewWorker(cfg.Temporal, temporal.Deps{Logger: logger, SDKClient: tcli.SDK()})
+	if err != nil {
+		return err
+	}
+	// Register workflows + activities before the worker starts. These are no-ops
+	// when the worker is disabled.
+	tworker.RegisterWorkflow(TransferSaga)
+	tworker.RegisterWorkflow(OrderSagaWorkflow)
+	tworker.RegisterActivity(Debit)
+	tworker.RegisterActivity(Credit)
+	registerTransferRoute(srv, tcli, cfg.Temporal, logger)
+	if cfg.Temporal.Enabled {
+		srv.Readiness().Register("temporal", tcli.CheckReady)
+	}
+
 	// 9. Lifecycle: tracing first, server last → server drains before tracing
 	// flushes on shutdown. Redis, kafka and cron sit between (stop after the server).
 	mgr := lifecycle.New(cfg.Lifecycle, logger.LifecycleAdapter())
@@ -330,7 +366,9 @@ func run() error {
 	mgr.Register(kProducer)
 	mgr.Register(kConsumer)
 	mgr.Register(cronSched)
-	mgr.Register(gen) // after redis (stops before redis closes), before the server
+	mgr.Register(gen)     // after redis (stops before redis closes), before the server
+	mgr.Register(tcli)    // temporal client owns the connection
+	mgr.Register(tworker) // registered after the client so it drains first, then the client closes the connection
 	mgr.Register(srv)
 
 	logger.Info("starting service",

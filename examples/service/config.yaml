@@ -152,6 +152,45 @@ snowflake:
   metrics:
     enabled: true
 
+temporal:
+  enabled: false # set true (and run `temporal server start-dev`) to exercise the saga demo via POST /transfer
+  connection:
+    host_port: localhost:7233
+    namespace: default
+    # identity: "" # default: SDK derives pid@hostname
+    tls:
+      enabled: false
+      # ca_file / cert_file / key_file / server_name for mutual TLS
+  client:
+    default_workflow_task_timeout: 10s
+  worker:
+    enabled: true # independent of the client: a frontend that only starts workflows can leave this false
+    task_queue: example-service-tasks # REQUIRED when enabled (main.go defaults it from service_name)
+    stop_timeout: 30s
+    # --- OOM / memory controls ---
+    sticky:
+      cache_size: 10000 # PROCESS-GLOBAL across all workers in this process; first non-zero value wins
+      schedule_to_start_timeout: 5s
+    resource_tuner: # opt-in dynamic slot throttling; MUTUALLY EXCLUSIVE with concurrency.* execution caps
+      enabled: false
+      target_memory: 0.8 # keep system memory under 80%
+      target_cpu: 0.9
+    concurrency: # used only when resource_tuner.enabled = false
+      max_concurrent_workflow_task_execution_size: 1000
+      max_concurrent_activity_execution_size: 1000
+      max_concurrent_local_activity_execution_size: 1000
+      max_concurrent_workflow_task_pollers: 2
+      max_concurrent_activity_task_pollers: 2
+  history: # Continue-As-New guard: bounds a single run's history (the headline lever against ballooning history)
+    max_events: 10000 # CAN when the event count reaches this
+    max_bytes: 20971520 # 20 MiB; CAN when history size reaches this
+    # ignore_server_suggestion: false # false = also CAN when the Temporal server suggests it
+  metrics:
+    enabled: true # bridge the SDK's own metrics into the shared Prometheus registry via tally
+    prefix: temporal
+  tracing:
+    enabled: true
+
 lifecycle:
   shutdown_timeout: 30s
   start_timeout: 15s

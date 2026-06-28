@@ -37,6 +37,16 @@ Module: `github.com/tuanlao/pulse` · Go 1.26+
   (String/Base2-64/bytes/JSON) and a pluggable **worker id**: static, the
   **StatefulSet pod ordinal**, or **redis slot contention** (pods race for a
   unique slot, lease-renewed, fenced on loss).
+- **Kafka** — `franz-go` producer + consumer split into focused sub-packages
+  (codec, retry, dedup, admin, metrics, trace) with Spring-style **non-blocking
+  retry topics + DLQ**, ordered/unordered/key-ordered modes, otter/redis
+  **dedup**, topic provisioning, and W3C trace propagation through headers.
+- **Temporal** — saga / **distributed transactions** orchestrated by Temporal.io:
+  split `client` + `worker` `lifecycle.Component`s plus an in-workflow **saga
+  helper** (reverse/parallel compensation), and first-class controls against
+  **history-bloat OOM** — a Continue-As-New guard, the process-global sticky
+  cache, concurrency caps, and an opt-in resource-based tuner. SDK metrics bridge
+  into the shared Prometheus registry; OTel spans propagate across workflows.
 
 ## Install
 
@@ -98,6 +108,8 @@ derive the gin mode (`cfg.Server.Mode = cfg.Env.GinMode()`).
 | [`pkg/cron`](pkg/cron/README.md) | gocron scheduler: tracing, metrics, recovery, config-declared jobs, redis distributed lock |
 | [`pkg/redis`](pkg/redis/README.md) | rueidis client: client-side caching (incl. BCAST prefixes), cluster/Sentinel/TLS, spans + metrics |
 | [`pkg/snowflake`](pkg/snowflake/README.md) | Twitter-style snowflake ids + conversions; worker id via static / StatefulSet ordinal / redis slot contention |
+| [`pkg/kafka`](pkg/kafka/README.md) | franz-go producer + consumer: non-blocking retry topics + DLQ, dedup, admin/topic provisioning, codec, spans + metrics |
+| [`pkg/temporal`](pkg/temporal/README.md) | Temporal.io saga / distributed transactions: [client](pkg/temporal/client/README.md) + [worker](pkg/temporal/worker/README.md) components, in-workflow [saga](pkg/temporal/saga/README.md) helper, Continue-As-New + worker controls against history-bloat OOM |
 | [`pkg/swagger`](pkg/swagger/README.md) | Swagger UI mount (disabled by default) |
 | [`pkg/version`](pkg/version/README.md) | Build metadata injected via ldflags |
 | [`examples/service`](examples/service/README.md) | Canonical composition root |
@@ -124,6 +136,6 @@ golangci-lint run        # if installed
 ## Status
 
 Implemented: config, env, lifecycle, log, tracing, metrics, http server + client,
-cron, redis, kafka, snowflake, swagger, version. Planned (future phases): gRPC,
-database — each will slot in as a sibling package implementing
+cron, redis, kafka, snowflake, temporal, swagger, version. Planned (future
+phases): gRPC, database — each will slot in as a sibling package implementing
 `lifecycle.Component`.
