@@ -89,3 +89,110 @@ func TestDisabledComponents(t *testing.T) {
 	// On must be safe on a disabled consumer (codec present, registers a handler).
 	On(cons, "orders", func(_ context.Context, _ map[string]any, _ *Message) error { return nil })
 }
+
+// newEntry is a small helper: a per-consumer config with the given group/topics
+// (other fields default via applyDefaults).
+func newEntry(group string, topics ...string) ConsumerConfig {
+	cc := ConsumerConfig{}
+	cc.GroupID = group
+	cc.Topics = topics
+	return cc
+}
+
+func TestConsumersApplyDefaults(t *testing.T) {
+	c := DefaultConfig()
+	audit := newEntry("g-audit", "orders")
+	audit.Mode = "ordered"      // explicit per-consumer override is preserved
+	audit.Retry.Enabled = false // diverge from the orders consumer
+	c.Consumers = map[string]ConsumerConfig{
+		"orders": newEntry("g-orders", "orders"),
+		"audit":  audit,
+	}
+	c.applyDefaults()
+	c.applyDefaults() // idempotent
+
+	o := c.Consumers["orders"]
+	if o.Mode != "unordered" {
+		t.Errorf("orders Mode = %q, want unordered (default)", o.Mode)
+	}
+	if o.Concurrency != 256 {
+		t.Errorf("orders Concurrency = %d, want 256 (default)", o.Concurrency)
+	}
+	if len(o.Retry.Backoffs) != 3 {
+		t.Errorf("orders Retry.Backoffs = %d, want 3 (default)", len(o.Retry.Backoffs))
+	}
+	if o.Dedup.TTL <= 0 {
+		t.Error("orders Dedup.TTL should be defaulted")
+	}
+	if a := c.Consumers["audit"]; a.Mode != "ordered" || a.Retry.Enabled {
+		t.Errorf("audit overrides not preserved: mode=%q retry.enabled=%v", a.Mode, a.Retry.Enabled)
+	}
+}
+
+func TestNewConsumers(t *testing.T) {
+	c := DefaultConfig()
+	c.Consumers = map[string]ConsumerConfig{
+		"orders": newEntry("grp-orders", "orders"),
+		"audit":  newEntry("grp-audit", "orders"),
+	}
+	set, err := NewConsumers(c, Deps{})
+	if err != nil {
+		t.Fatalf("NewConsumers: %v", err)
+	}
+	if set.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", set.Len())
+	}
+	got, ok := set.Get("orders")
+	if !ok {
+		t.Fatal("Get(orders): not found")
+	}
+	// Name() embeds the per-consumer group id — proof each got its own config.
+	if got.Name() != "kafka-consumer:grp-orders" {
+		t.Errorf("orders Name = %q, want kafka-consumer:grp-orders", got.Name())
+	}
+	if _, ok := set.Get("missing"); ok {
+		t.Error("Get(missing) should be false")
+	}
+	if names := set.Names(); len(names) != 2 || names[0] != "audit" || names[1] != "orders" {
+		t.Errorf("Names = %v, want [audit orders] (sorted)", names)
+	}
+	if len(set.Components()) != 2 {
+		t.Errorf("Components len = %d, want 2", len(set.Components()))
+	}
+
+	// MustGet panics on an undeclared name.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("MustGet(nope) should panic")
+			}
+		}()
+		_ = set.MustGet("nope")
+	}()
+}
+
+func TestNewConsumersDisabled(t *testing.T) {
+	c := DefaultConfig()
+	c.Enabled = false
+	c.Consumers = map[string]ConsumerConfig{"x": newEntry("g", "t")}
+	set, err := NewConsumers(c, Deps{})
+	if err != nil {
+		t.Fatalf("NewConsumers(disabled): %v", err)
+	}
+	x, ok := set.Get("x")
+	if !ok || x == nil {
+		t.Fatal("Get(x) should return a (disabled) consumer")
+	}
+	// A disabled consumer's Start is a no-op (no broker needed).
+	if err := x.Start(context.Background()); err != nil {
+		t.Errorf("disabled Start: %v", err)
+	}
+}
+
+func TestConsumerConfigDLQTopic(t *testing.T) {
+	cc := DefaultConsumerConfig()
+	cc.GroupID = "g"
+	if got := cc.DLQTopic("orders"); got != "orders.dlq" {
+		t.Errorf("ConsumerConfig.DLQTopic = %q, want orders.dlq", got)
+	}
+}

@@ -329,17 +329,32 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	kConsumer, err := kafka.NewConsumer(cfg.Kafka, kafkaDeps)
+	// Build every consumer declared under kafka.consumers in config.yaml. Each is a
+	// fully independent consumer group; look one up by its config name (the map key)
+	// to bind handlers. For a one-off consumer not in config, declare it in code:
+	//   c, _ := kafka.NewConsumer(cfg.Kafka, kafkaDeps,
+	//       kafka.WithGroupID("ad-hoc"), kafka.WithTopics("ad-hoc-topic"))
+	kConsumers, err := kafka.NewConsumers(cfg.Kafka, kafkaDeps)
 	if err != nil {
 		return err
 	}
-	// Typed handler: the payload is JSON-decoded into orderEvent before it runs.
-	// Returning an error exercises the retry-topic pipeline; kafka.NonRetryable
-	// would route straight to the DLQ.
-	kafka.On(kConsumer, "orders", func(hctx context.Context, e orderEvent, _ *kafka.Message) error {
-		log.FromContext(hctx, logger).Info("order received", zap.String("id", e.ID), zap.Int("amount", e.Amount))
-		return nil
-	})
+	// "orders" consumer: typed handler — the payload is JSON-decoded into orderEvent
+	// before it runs. Returning an error exercises the retry-topic pipeline;
+	// kafka.NonRetryable would route straight to the DLQ.
+	if c, ok := kConsumers.Get("orders"); ok {
+		kafka.On(c, "orders", func(hctx context.Context, e orderEvent, _ *kafka.Message) error {
+			log.FromContext(hctx, logger).Info("order received", zap.String("id", e.ID), zap.Int("amount", e.Amount))
+			return nil
+		})
+	}
+	// "audit" consumer: a SEPARATE group on the same topic, so it receives its own
+	// copy of every record (fan-out). Bind its handler the same way.
+	if c, ok := kConsumers.Get("audit"); ok {
+		kafka.On(c, "orders", func(hctx context.Context, e orderEvent, _ *kafka.Message) error {
+			log.FromContext(hctx, logger).Info("order audited", zap.String("id", e.ID))
+			return nil
+		})
+	}
 	registerPublishRoute(srv, kProducer, logger)
 
 	// 8b. Temporal (saga orchestrator). Disabled by default in config.yaml so the
@@ -419,7 +434,7 @@ func run() error {
 		mgr.Register(rdb)
 	}
 	mgr.Register(kProducer)
-	mgr.Register(kConsumer)
+	mgr.Register(kConsumers.Components()...) // every declared consumer (each its own group)
 	mgr.Register(cronSched)
 	mgr.Register(gen)     // after redis (stops before redis closes), before the server
 	mgr.Register(tcli)    // temporal client owns the connection

@@ -10,7 +10,7 @@ To stay maintainable, the component is split into focused sub-packages behind a
 thin facade. Callers import only `pkg/kafka`.
 
 ```
-pkg/kafka/            facade: Config, Deps, NewProducer, NewConsumer, Send[T], On[T], aliases
+pkg/kafka/            facade: Config, Deps, NewProducer, NewConsumer, NewConsumers/ConsumerSet, Send[T], On[T], aliases
   message/            Message envelope, typed Headers, Hooks, ErrorClass, NonRetryable
   codec/              Codec interface + JSON default (swap in protobuf/msgpack via Deps.Codec)
   producer/           Producer (lifecycle.Component): Produce / ProduceSync / Send
@@ -47,6 +47,54 @@ mgr.Register(producer, consumer) // implement lifecycle.Component
 
 // produce:
 _ = kafka.Send(ctx, producer, "orders", order.ID, OrderCreated{...})
+```
+
+## Multiple consumers / multiple groups (`consumers`)
+
+`NewConsumer` builds one consumer from `consumer` + `retry` + `dedup`. To consume
+different topics under different groups from one service, declare a `consumers` map
+— each entry is **fully independent** (its own `group_id`, `topics`, `mode`,
+`concurrency`, `retry`/DLQ and `dedup`) — and build them with `NewConsumers`:
+
+```yaml
+kafka:
+  client: { brokers: ["localhost:9092"] }   # shared: one cluster per service
+  consumers:
+    orders:                                  # <- the name you Get() in code
+      group_id: svc-orders
+      topics: ["orders"]
+      mode: unordered
+      retry: { enabled: true, backoffs: ["5s","1m"], dlq: { enabled: true } }
+    audit:                                   # different group => its own copy of each record
+      group_id: svc-audit
+      topics: ["orders", "users"]
+      mode: ordered
+      retry: { enabled: false }
+```
+
+```go
+consumers, _ := kafka.NewConsumers(cfg.Kafka, deps)
+
+if c, ok := consumers.Get("orders"); ok {   // look up by the config name
+    kafka.On(c, "orders", handleOrder)
+}
+if c, ok := consumers.Get("audit"); ok {
+    kafka.On(c, "orders", handleAudit)
+    kafka.On(c, "users", handleUser)
+}
+
+mgr.Register(consumers.Components()...)      // register them all (each its own group)
+```
+
+`ConsumerSet` also has `MustGet`, `Names`, `Each`, `Len`. The shared connection,
+admin (topic provisioning), tracing and metrics come from the parent `Config`.
+
+**Manual / no config** — build one programmatically instead (e.g. for a one-off):
+
+```go
+c, _ := kafka.NewConsumer(cfg.Kafka, deps,
+    kafka.WithGroupID("ad-hoc"), kafka.WithTopics("ad-hoc-topic"))
+// or start from kafka.DefaultConsumerConfig() and set fields yourself.
 ```
 
 ## Processing modes (`consumer.mode`)
@@ -127,13 +175,14 @@ fast — the enterprise pattern where topics are managed out of band.
 | `producer.required_acks` | `all` | `leader` / `none` disable idempotency |
 | `producer.linger` | `10ms` | |
 | `producer.compression` | `snappy` | `gzip`/`lz4`/`zstd`/`none` |
-| `consumer.group_id` | — | required to consume |
+| `consumer.group_id` | — | required to consume (single/manual consumer) |
 | `consumer.topics` | — | origin topics (get the retry/DLQ pipeline) |
 | `consumer.mode` | `unordered` | `ordered` / `key_ordered` |
 | `consumer.commit_immediately` | `false` | `true` = at-most-once |
 | `consumer.concurrency` | `256` | ants pool size / lane count |
 | `consumer.max_poll_records` | `500` | |
 | `consumer.drain_timeout` | `30s` | graceful-shutdown drain bound |
+| `consumers.<name>` | — | a named independent consumer; same fields as `consumer.*` **plus** its own nested `retry` / `dedup`. Built by `NewConsumers`, looked up by `<name>` |
 | `admin.auto_create` | `true` | else validate + fail fast |
 | `admin.partitions` | `4` | |
 | `admin.replication_factor` | `1` | ≥3 in prod |

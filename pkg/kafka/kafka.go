@@ -12,6 +12,7 @@ package kafka
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/rueidis"
@@ -22,6 +23,7 @@ import (
 	kmetrics "github.com/tuanlao/pulse/pkg/kafka/metrics"
 	"github.com/tuanlao/pulse/pkg/kafka/producer"
 	"github.com/tuanlao/pulse/pkg/kafka/retry"
+	"github.com/tuanlao/pulse/pkg/lifecycle"
 	"github.com/tuanlao/pulse/pkg/log"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
@@ -107,19 +109,105 @@ func NewProducer(cfg Config, deps Deps, opts ...Option) (*producer.Producer, err
 	return producer.New(cfg.Producer, buildProducerDeps(cfg, deps))
 }
 
-// NewConsumer builds the Kafka consumer. When the component is disabled it
-// returns a no-op consumer. Bind handlers with consumer.Register / On before
-// registering it into the lifecycle manager.
+// NewConsumer builds a single Kafka consumer from cfg.Consumer (with cfg.Retry /
+// cfg.Dedup), the manual path also driven by the With* options. When the component
+// is disabled it returns a no-op consumer. Bind handlers with consumer.Register /
+// On before registering it into the lifecycle manager. For several independent
+// consumers declared in config, use NewConsumers.
 func NewConsumer(cfg Config, deps Deps, opts ...Option) (*consumer.Consumer, error) {
 	cfg = resolve(cfg, opts)
 	if !cfg.Enabled {
 		return consumer.Disabled(deps.Logger), nil
 	}
-	cdeps, err := buildConsumerDeps(cfg, deps)
+	cdeps, err := buildConsumerDeps(cfg, cfg.Retry, cfg.Dedup, deps)
 	if err != nil {
 		return nil, err
 	}
 	return consumer.New(cfg.Consumer, cdeps)
+}
+
+// ConsumerSet is the set of consumers built by NewConsumers from Config.Consumers,
+// keyed by the name each was declared under in config. Look one up with Get /
+// MustGet to bind its handlers, then register them all into the lifecycle manager
+// with Components.
+type ConsumerSet struct {
+	m map[string]*consumer.Consumer
+}
+
+// Get returns the consumer declared under name (the Config.Consumers map key) and
+// whether it exists.
+func (s ConsumerSet) Get(name string) (*consumer.Consumer, bool) {
+	c, ok := s.m[name]
+	return c, ok
+}
+
+// MustGet is Get but panics when name is absent — for wiring code where a missing
+// consumer is a config/programmer error.
+func (s ConsumerSet) MustGet(name string) *consumer.Consumer {
+	c, ok := s.m[name]
+	if !ok {
+		panic(fmt.Sprintf("kafka: no consumer %q declared in config", name))
+	}
+	return c
+}
+
+// Names returns the declared consumer names, sorted.
+func (s ConsumerSet) Names() []string {
+	names := make([]string, 0, len(s.m))
+	for name := range s.m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// Each calls fn for every consumer in name order.
+func (s ConsumerSet) Each(fn func(name string, c *consumer.Consumer)) {
+	for _, name := range s.Names() {
+		fn(name, s.m[name])
+	}
+}
+
+// Components returns every consumer as a lifecycle.Component (in name order), for
+// mgr.Register(set.Components()...).
+func (s ConsumerSet) Components() []lifecycle.Component {
+	out := make([]lifecycle.Component, 0, len(s.m))
+	for _, name := range s.Names() {
+		out = append(out, s.m[name])
+	}
+	return out
+}
+
+// Len reports how many consumers are in the set.
+func (s ConsumerSet) Len() int { return len(s.m) }
+
+// NewConsumers builds every consumer declared in cfg.Consumers, keyed by its
+// config name. Each entry is fully independent (its own group, topics, mode,
+// concurrency, retry/DLQ and dedup); the shared connection/admin/tracing/metrics
+// come from cfg. When the kafka component is disabled every entry is a no-op
+// consumer, so Get + handler binding + lifecycle registration stay safe. Bind
+// handlers per consumer (Get/MustGet + On/Register) before registering the set's
+// Components into the lifecycle manager. opts apply to the shared cfg (e.g.
+// WithBrokers); per-consumer fields live in each entry.
+func NewConsumers(cfg Config, deps Deps, opts ...Option) (ConsumerSet, error) {
+	cfg = resolve(cfg, opts)
+	set := ConsumerSet{m: make(map[string]*consumer.Consumer, len(cfg.Consumers))}
+	for name, cc := range cfg.Consumers {
+		if !cfg.Enabled {
+			set.m[name] = consumer.Disabled(deps.Logger)
+			continue
+		}
+		cdeps, err := buildConsumerDeps(cfg, cc.Retry, cc.Dedup, deps)
+		if err != nil {
+			return ConsumerSet{}, fmt.Errorf("kafka: consumer %q: %w", name, err)
+		}
+		c, err := consumer.New(cc.Config, cdeps)
+		if err != nil {
+			return ConsumerSet{}, fmt.Errorf("kafka: consumer %q: %w", name, err)
+		}
+		set.m[name] = c
+	}
+	return set, nil
 }
 
 // Send marshals a typed event with the producer's codec and produces it to topic.

@@ -29,12 +29,61 @@ type Config struct {
 
 	Client   kclient.Config  `mapstructure:"client"`
 	Producer producer.Config `mapstructure:"producer"`
+
+	// Consumer is the single "default" consumer built by NewConsumer (the manual
+	// path, also driven by the WithGroupID/WithTopics/... options). Its retry and
+	// dedup come from the sibling Retry/Dedup below.
 	Consumer consumer.Config `mapstructure:"consumer"`
-	Admin    admin.Config    `mapstructure:"admin"`
-	Retry    retry.Config    `mapstructure:"retry"`
-	Dedup    dedup.Config    `mapstructure:"dedup"`
-	Metrics  kmetrics.Config `mapstructure:"metrics"`
-	Trace    ktrace.Config   `mapstructure:"trace"`
+	// Consumers are named, fully independent consumers — each with its OWN group,
+	// topics, mode, concurrency, retry/DLQ and dedup — built together by
+	// NewConsumers and looked up by name. Use this to consume different topics
+	// under different consumer groups from one service. The shared connection
+	// (Client), topic provisioning (Admin), tracing and metrics still come from
+	// this Config: every consumer in a service talks to the same cluster. Empty by
+	// default (declare entries in config.yaml under `consumers:`).
+	Consumers map[string]ConsumerConfig `mapstructure:"consumers"`
+
+	Admin   admin.Config    `mapstructure:"admin"`
+	Retry   retry.Config    `mapstructure:"retry"`
+	Dedup   dedup.Config    `mapstructure:"dedup"`
+	Metrics kmetrics.Config `mapstructure:"metrics"`
+	Trace   ktrace.Config   `mapstructure:"trace"`
+}
+
+// ConsumerConfig is one consumer's fully independent configuration: its behavior
+// (consumer.Config — group_id/topics/mode/concurrency/... — squashed in) plus its
+// own retry/DLQ and dedup policy. It is the element type of Config.Consumers; the
+// shared connection/admin/tracing/metrics come from the parent Config. Build one
+// programmatically from DefaultConsumerConfig() (the manual path), or declare it
+// under `consumers:` in config.yaml.
+type ConsumerConfig struct {
+	consumer.Config `mapstructure:",squash"`
+	Retry           retry.Config `mapstructure:"retry"`
+	Dedup           dedup.Config `mapstructure:"dedup"`
+}
+
+// DefaultConsumerConfig composes the per-consumer defaults — the base to start
+// from when declaring a consumer in code rather than from config.
+func DefaultConsumerConfig() ConsumerConfig {
+	return ConsumerConfig{
+		Config: consumer.DefaultConfig(),
+		Retry:  retry.DefaultConfig(),
+		Dedup:  dedup.DefaultConfig(),
+	}
+}
+
+// ApplyDefaults fills empty fields on the entry and its retry/dedup sub-configs.
+func (cc *ConsumerConfig) ApplyDefaults() {
+	cc.Config.ApplyDefaults()
+	cc.Retry.ApplyDefaults()
+	cc.Dedup.ApplyDefaults()
+}
+
+// DLQTopic returns the DLQ topic name for an origin under this consumer's retry +
+// group settings (so a service can Register a terminal handler to consume it).
+func (cc ConsumerConfig) DLQTopic(origin string) string {
+	cc.ApplyDefaults()
+	return retry.NewNamer(cc.Retry).DLQTopic(origin, cc.GroupID)
 }
 
 // DefaultConfig composes each sub-config's defaults.
@@ -62,6 +111,10 @@ func (c *Config) applyDefaults() {
 	c.Retry.ApplyDefaults()
 	c.Dedup.ApplyDefaults()
 	c.Metrics.ApplyDefaults(kmetrics.DefaultConfig())
+	for name, cc := range c.Consumers {
+		cc.ApplyDefaults()
+		c.Consumers[name] = cc
+	}
 }
 
 // source identifies the producing service (stamped as the x-source header).
