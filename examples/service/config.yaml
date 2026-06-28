@@ -191,6 +191,30 @@ temporal:
   tracing:
     enabled: true
 
+grpc:
+  port: 9090
+  enable_health: true
+  enable_reflection: true # dev convenience: `grpcurl -plaintext localhost:9090 list`
+  # max_recv_msg_size: 4194304
+  # keepalive: { time: 2h, timeout: 20s, max_connection_age: 0 }
+  # tls: { enabled: true, cert_file: server.pem, key_file: server-key.pem, client_ca_file: ca.pem } # client_ca_file => mTLS
+  metrics:
+    enabled: true
+
+grpc_client:
+  target: 127.0.0.1:9090 # defaults to this service's gRPC server when empty (main.go)
+  timeouts:
+    request: 10s # per-call deadline applied only when the caller ctx has none
+  retry:
+    enabled: true
+    max_attempts: 3
+    retryable_status_codes: ["UNAVAILABLE"]
+  trace:
+    trace_id_header: x-trace-id # metadata keys are lowercased by gRPC
+  # tls: { enabled: true, ca_file: ca.pem, server_name_override: localhost } # ca_file optional (empty = system roots)
+  metrics:
+    enabled: true
+
 lifecycle:
   shutdown_timeout: 30s
   start_timeout: 15s

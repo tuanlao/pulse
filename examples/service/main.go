@@ -28,6 +28,9 @@ import (
 	"github.com/tuanlao/pulse/pkg/config"
 	"github.com/tuanlao/pulse/pkg/cron"
 	"github.com/tuanlao/pulse/pkg/env"
+	grpcclient "github.com/tuanlao/pulse/pkg/grpc/client"
+	grpcserver "github.com/tuanlao/pulse/pkg/grpc/server"
+	grpcinterceptor "github.com/tuanlao/pulse/pkg/grpc/server/interceptor"
 	"github.com/tuanlao/pulse/pkg/http/client"
 	"github.com/tuanlao/pulse/pkg/http/server"
 	"github.com/tuanlao/pulse/pkg/kafka"
@@ -40,6 +43,7 @@ import (
 	"github.com/tuanlao/pulse/pkg/temporal"
 	"github.com/tuanlao/pulse/pkg/tracing"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
 // appConfig is THIS service's config. Pulse has no unified app.Config — a service
@@ -60,6 +64,9 @@ type appConfig struct {
 	Kafka     kafka.Config     `mapstructure:"kafka"`
 	Snowflake snowflake.Config `mapstructure:"snowflake"`
 	Temporal  temporal.Config  `mapstructure:"temporal"`
+
+	Grpc       grpcserver.Config `mapstructure:"grpc"`
+	GrpcClient grpcclient.Config `mapstructure:"grpc_client"`
 
 	// Named upstream HTTP clients (e.g. "self", "payment").
 	HttpClients map[string]client.Config `mapstructure:"http_clients"`
@@ -87,6 +94,8 @@ func defaultAppConfig() appConfig {
 		Kafka:       kafka.DefaultConfig(),
 		Snowflake:   snowflake.DefaultConfig(),
 		Temporal:    temporal.DefaultConfig(),
+		Grpc:        grpcserver.DefaultConfig(),
+		GrpcClient:  grpcclient.DefaultConfig(),
 		HttpClients: map[string]client.Config{},
 		Lifecycle:   lifecycle.DefaultConfig(),
 	}
@@ -124,6 +133,11 @@ func (c *appConfig) normalize() {
 	// to flip temporal.enabled on.
 	if c.Temporal.Worker.TaskQueue == "" {
 		c.Temporal.Worker.TaskQueue = c.ServiceName + "-tasks"
+	}
+	// Default the gRPC client target to this service's own gRPC server when unset
+	// (analogous to the "self" HTTP client's base_url default).
+	if c.GrpcClient.Target == "" {
+		c.GrpcClient.Target = fmt.Sprintf("127.0.0.1:%d", c.Grpc.Port)
 	}
 }
 
@@ -356,6 +370,47 @@ func run() error {
 		srv.Readiness().Register("temporal", tcli.CheckReady)
 	}
 
+	// 8c. gRPC server + client. The server serves the health + reflection services
+	// by default (register your generated stubs via grpcSrv.Register before Start);
+	// the client dials this service's own gRPC server lazily. Both share the metrics
+	// registry, so /metrics exposes grpc_server/grpc_client series too. The
+	// /grpc/health route below calls the server through the client end-to-end.
+	var grpcServerMetrics *grpcinterceptor.Metrics
+	var grpcClientMetrics *grpcclient.ClientMetrics
+	if red != nil {
+		if grpcServerMetrics, err = grpcinterceptor.NewMetrics(cfg.Grpc.Metrics, red.Registry()); err != nil {
+			return err
+		}
+		if cfg.GrpcClient.Metrics.Enabled {
+			if grpcClientMetrics, err = grpcclient.NewMetrics(cfg.GrpcClient.Metrics, red.Registry()); err != nil {
+				return err
+			}
+		}
+	}
+	grpcSrv, err := grpcserver.New(cfg.Grpc, grpcserver.Deps{
+		Logger:         logger,
+		Metrics:        grpcServerMetrics,
+		TracerProvider: tracer.Provider(),
+		ServiceName:    cfg.ServiceName,
+		OnServeError:   func(error) { cancel() },
+	})
+	if err != nil {
+		return err
+	}
+	// Register your generated stubs here before Start, e.g.:
+	//   grpcSrv.Register(func(s *grpc.Server) { pb.RegisterMyServiceServer(s, impl) })
+	srv.Readiness().Register("grpc", grpcSrv.CheckReady)
+
+	grpcClient, err := grpcclient.New(cfg.GrpcClient, grpcclient.Deps{
+		Logger:         logger,
+		Metrics:        grpcClientMetrics,
+		TracerProvider: tracer.Provider(),
+	})
+	if err != nil {
+		return err
+	}
+	registerGrpcHealthRoute(srv, grpcClient, logger)
+
 	// 9. Lifecycle: tracing first, server last → server drains before tracing
 	// flushes on shutdown. Redis, kafka and cron sit between (stop after the server).
 	mgr := lifecycle.New(cfg.Lifecycle, logger.LifecycleAdapter())
@@ -369,6 +424,8 @@ func run() error {
 	mgr.Register(gen)     // after redis (stops before redis closes), before the server
 	mgr.Register(tcli)    // temporal client owns the connection
 	mgr.Register(tworker) // registered after the client so it drains first, then the client closes the connection
+	mgr.Register(grpcClient)
+	mgr.Register(grpcSrv) // gRPC server drains before its dependencies (registered just before the HTTP server)
 	mgr.Register(srv)
 
 	logger.Info("starting service",
@@ -422,6 +479,23 @@ func registerIDRoute(srv *server.Server, gen *snowflake.Generator, base *log.Log
 			"step":   gen.Step(id),
 			"time":   gen.TimeAt(id).UTC().Format(time.RFC3339Nano),
 		})
+	})
+}
+
+// registerGrpcHealthRoute calls this service's own gRPC server health Check
+// through the gRPC client, demonstrating the outbound client end-to-end (the
+// inbound request's trace id propagates into the gRPC metadata).
+func registerGrpcHealthRoute(srv *server.Server, gc *grpcclient.Client, base *log.Logger) {
+	srv.Engine().GET("/grpc/health", func(gctx *gin.Context) {
+		l := log.FromContext(gctx.Request.Context(), base)
+		resp, err := grpc_health_v1.NewHealthClient(gc.Conn()).Check(
+			gctx.Request.Context(), &grpc_health_v1.HealthCheckRequest{})
+		if err != nil {
+			l.Error("grpc health check failed", zap.Error(err))
+			gctx.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		gctx.JSON(http.StatusOK, gin.H{"status": resp.Status.String()})
 	})
 }
 
